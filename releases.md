@@ -1,6 +1,6 @@
 # Releases
 
-## Unreleased
+## v0.1.0
 
 - Add `MultipartParser`, a sans-I/O parser for multipart bodies following RFC 2046, which is fed bytes as they arrive, reports each part's header section and content borrowed from its input, applies limits on the preamble, header sections, and number of parts, and rejects folded header lines and misplaced boundaries.
 - Add `parts`, which iterates over the parts of a complete body.
