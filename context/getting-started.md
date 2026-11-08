@@ -102,7 +102,7 @@ assert_eq!(error.kind(), MultipartErrorKind::PartCountLimit);
 
 Content is not limited here. Limits on fields and uploads belong to whatever consumes the content, such as `base-web-content`'s forms.
 
-The parser is strict where leniency would let two readers see different parts. Every line must end with CRLF; a folded header line is an error; a header name must be a valid field name; a boundary must be followed only by optional spaces and tabs and a line break, or by `--`; and a boundary after a bare CR or LF, which some readers take for a delimiter, is an error. A boundary appearing in content where RFC 2046 does not allow it is therefore an error rather than something to guess about. A body may end immediately after its closing `--`; `finish` accepts it. Errors report the offset in the body and never repeat its bytes, and a parser that has reported an error reports it again.
+The parser is strict where leniency would let two readers see different parts. Every line must end with CRLF; a folded header line is an error; a header name must be a valid field name; a boundary must be followed only by optional spaces and tabs and a line break, or by `--`; and a boundary after a bare CR or LF, which some readers take for a delimiter, is an error. A boundary appearing in content where RFC 2046 does not allow it is therefore an error rather than something to guess about. A body may end immediately after its closing `--`; `finish` accepts it. Errors report the offset in the body, the same however it was split, and never repeat its bytes, and a parser that has reported an error reports it again.
 
 ## Writing a body
 

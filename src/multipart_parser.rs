@@ -138,8 +138,7 @@ impl MultipartParser {
                 self.offset += consumed as u64;
                 Ok(Parsed { consumed, event })
             }
-            Err(kind) => {
-                let error = MultipartError::new(kind, self.offset + consumed as u64);
+            Err(error) => {
                 self.failed = Some(error);
                 Err(error)
             }
@@ -168,7 +167,10 @@ impl MultipartParser {
         &mut self,
         input: &'a [u8],
         consumed: &mut usize,
-    ) -> Result<MultipartEvent<'a>, MultipartErrorKind> {
+    ) -> Result<MultipartEvent<'a>, MultipartError> {
+        // An error at this position in the input; the preamble and padding limits give their own offsets.
+        let error =
+            |kind, consumed: usize| MultipartError::new(kind, self.offset + consumed as u64);
         loop {
             let rest = &input[*consumed..];
             match self.state {
@@ -184,24 +186,32 @@ impl MultipartParser {
                     }
                 }
                 State::Preamble => {
-                    let (skipped, found) = match self.find(rest) {
-                        Found::Delimiter(index) => (index, true),
-                        Found::Bare(index) => {
-                            *consumed += index;
-                            return Err(MultipartErrorKind::InvalidDelimiter);
-                        }
-                        Found::Absent => (self.safe_length(rest), false),
+                    let found = self.find(rest);
+                    // The preamble before a bare line break is counted before the break is refused, as it is when the body is split before the break.
+                    let skipped = match found {
+                        Found::Delimiter(index) | Found::Bare(index) => index,
+                        Found::Absent => self.safe_length(rest),
                     };
-                    self.preamble_size = self.preamble_size.saturating_add(skipped);
-                    if self.preamble_size > self.limits.preamble_size_limit {
-                        return Err(MultipartErrorKind::PreambleSizeLimit);
+                    // The preamble size never exceeds its limit, so this does not overflow.
+                    if skipped > self.limits.preamble_size_limit - self.preamble_size {
+                        // The preamble begins the body, so the error is at its start however the body is split.
+                        return Err(MultipartError::new(
+                            MultipartErrorKind::PreambleSizeLimit,
+                            0,
+                        ));
                     }
+                    self.preamble_size += skipped;
                     *consumed += skipped;
-                    if !found {
-                        return Ok(MultipartEvent::Incomplete);
+                    match found {
+                        Found::Delimiter(_) => {
+                            *consumed += self.delimiter.len();
+                            self.state = State::Delimiter { padding: 0 };
+                        }
+                        Found::Bare(_) => {
+                            return Err(error(MultipartErrorKind::InvalidDelimiter, *consumed));
+                        }
+                        Found::Absent => return Ok(MultipartEvent::Incomplete),
                     }
-                    *consumed += self.delimiter.len();
-                    self.state = State::Delimiter { padding: 0 };
                 }
                 State::Delimiter { padding } => {
                     if padding == 0 && rest.starts_with(b"--") {
@@ -215,7 +225,7 @@ impl MultipartParser {
                     if rest.starts_with(b"\r\n") {
                         self.part_count += 1;
                         if self.part_count > self.limits.part_count_limit {
-                            return Err(MultipartErrorKind::PartCountLimit);
+                            return Err(error(MultipartErrorKind::PartCountLimit, *consumed));
                         }
                         *consumed += 2;
                         self.state = State::Headers {
@@ -225,7 +235,7 @@ impl MultipartParser {
                     } else if rest.is_empty() || rest == b"\r" || (padding == 0 && rest == b"-") {
                         return Ok(MultipartEvent::Incomplete);
                     } else {
-                        return Err(MultipartErrorKind::InvalidDelimiter);
+                        return Err(error(MultipartErrorKind::InvalidDelimiter, *consumed));
                     }
                 }
                 State::Closing { padding } => {
@@ -240,7 +250,7 @@ impl MultipartParser {
                         // The body may also end here, which `finish` accepts.
                         return Ok(MultipartEvent::Incomplete);
                     } else {
-                        return Err(MultipartErrorKind::InvalidDelimiter);
+                        return Err(error(MultipartErrorKind::InvalidDelimiter, *consumed));
                     }
                 }
                 State::Headers { padding, searched } => {
@@ -256,7 +266,7 @@ impl MultipartParser {
                     let Some(length) = length else {
                         // A section within the limit ends within its length and the empty line's CRLF.
                         if rest.len() >= limit.saturating_add(2) {
-                            return Err(MultipartErrorKind::HeaderSizeLimit);
+                            return Err(error(MultipartErrorKind::HeaderSizeLimit, *consumed));
                         }
                         self.state = State::Headers {
                             padding,
@@ -265,10 +275,11 @@ impl MultipartParser {
                         return Ok(MultipartEvent::Incomplete);
                     };
                     if length > limit {
-                        return Err(MultipartErrorKind::HeaderSizeLimit);
+                        return Err(error(MultipartErrorKind::HeaderSizeLimit, *consumed));
                     }
                     let section = &rest[..length];
-                    self.check_section(section)?;
+                    self.check_section(section)
+                        .map_err(|kind| error(kind, *consumed))?;
                     *consumed += length;
                     self.state = State::BodyStart;
                     return Ok(MultipartEvent::Part(PartHead::new(section)));
@@ -298,9 +309,13 @@ impl MultipartParser {
                             *consumed += index;
                             Ok(MultipartEvent::Content(&rest[..index]))
                         }
+                        // The content before a bare line break is reported before the break is refused, as it is when the body is split before the break.
+                        Found::Bare(0) => {
+                            Err(error(MultipartErrorKind::InvalidDelimiter, *consumed))
+                        }
                         Found::Bare(index) => {
                             *consumed += index;
-                            Err(MultipartErrorKind::InvalidDelimiter)
+                            Ok(MultipartEvent::Content(&rest[..index]))
                         }
                         Found::Absent => match self.safe_length(rest) {
                             0 => Ok(MultipartEvent::Incomplete),
@@ -326,15 +341,21 @@ impl MultipartParser {
         rest: &[u8],
         padding: usize,
         consumed: &mut usize,
-    ) -> Result<usize, MultipartErrorKind> {
+    ) -> Result<usize, MultipartError> {
         let spaces = rest
             .iter()
             .take_while(|&&byte| byte == b' ' || byte == b'\t')
             .count();
-        let padding = padding + spaces;
-        if padding > self.limits.header_size_limit {
-            return Err(MultipartErrorKind::HeaderSizeLimit);
+        // The padding never exceeds the limit, so this does not overflow.
+        if spaces > self.limits.header_size_limit - padding {
+            // The padding consumed by earlier calls precedes this input, so the error is at the padding's start however the body is split.
+            let start = self.offset + *consumed as u64 - padding as u64;
+            return Err(MultipartError::new(
+                MultipartErrorKind::HeaderSizeLimit,
+                start,
+            ));
         }
+        let padding = padding + spaces;
         *consumed += spaces;
         Ok(padding)
     }
