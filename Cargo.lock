@@ -191,7 +191,7 @@ checksum = "8de5ee13308e03ad6a7e7e435f73071ac7e65b64f1aa045149827de067909683"
 
 [[package]]
 name = "base-web-multipart"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base-message",
  "base-web-media-type",
