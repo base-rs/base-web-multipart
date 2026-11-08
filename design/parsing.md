@@ -17,7 +17,9 @@ Parsing must be strict wherever leniency would let two readers see different par
 
 The parser must apply limits on the preamble's size, each header section's size, including any padding after the boundary before it, each header section's number of fields, and the number of parts, with defaults of 64 KiB, 64 KiB, 64, and 128, and without overflowing for any limit up to `usize::MAX`. It must not limit content. Errors must give the offset in the body, and once the parser reports an error it must report the same error again. Errors and `Debug` output must never include content or field values.
 
-`ContentDisposition` must parse a disposition type and parameters with token or quoted-string values, lowercasing the type and parameter names, rejecting duplicate parameters, more than 64 parameters, invalid UTF-8, and control characters, and borrowing unless a quoted string has escapes. In a quoted string, a backslash escapes only a quote or another backslash, and any other backslash is kept. Extended parameters, whose names end with `*`, must be written unquoted. `ContentTransferEncoding` must accept only the identity encodings `7bit`, `8bit`, and `binary`.
+`ContentDisposition` must parse a disposition type and parameters with token or quoted-string values, lowercasing the type and parameter names, rejecting duplicate parameters, more than 64 parameters, invalid UTF-8, and control characters, and borrowing unless a quoted string has escapes. In a quoted string, a backslash escapes only a quote or another backslash, and any other backslash is kept. Extended parameters, whose names end with `*`, must be written unquoted.
+
+`ContentDisposition` must not choose between a parameter and its extended form while parsing; its `name` and `filename` take `ParameterRules`, with no default. Under `FormData`, any extended parameter, including a continuation, is an error, as RFC 7578 section 4.2 forbids them. Under `Mime`, an extended parameter in UTF-8 or US-ASCII is decoded and takes the place of the plain one, as RFC 2231 says, and an unsupported character set, an invalid percent-encoding, or a continuation is an error. `ParameterRules::for_media_type` must give `FormData` for `multipart/form-data` and `Mime` for any other type. `ContentTransferEncoding` must accept only the identity encodings `7bit`, `8bit`, and `binary`.
 
 ## Rationale
 
@@ -25,9 +27,11 @@ The user asked for a strict, sans-I/O parser fed bytes, with the Ruby gem's stru
 
 An independent review before the first release compared the parser with Go's `mime/multipart`, Python's `email` package, and the Ruby gem. It found that a boundary straight after a header section was read as content, hiding the next part, which those readers see; that a boundary after a bare line break separates parts in some readers but not this one; and that unescaping every backslash corrupted Windows paths, which browsers send unescaped. The rules for the empty line, bare line breaks, the closing line, and backslashes follow from those findings.
 
+The review also found that a disposition with both `filename="safe.txt"` and `filename*=UTF-8''evil.php` read as `safe.txt` here and in Python's `email` package, but as `evil.php` in Go and Rack, so a front end and an application could see different files. No preference agrees with every reader, so form data, where RFC 7578 forbids extended parameters, refuses them. .NET's `MultipartFormDataContent` sends `filename*` with every file, but supporting it was judged not worth the ambiguity. Email and other MIME parts may use them legitimately, which is why the rules depend on the media type rather than parsing refusing them, and why continuations, which Go joins, are refused until they are joined here too.
+
 ## Scope
 
-`MultipartParser`, `MultipartEvent`, `Parsed`, `MultipartLimits`, `MultipartError`, `PartHead`, `Parts`, `ContentDisposition`, `ContentType`, `ContentTransferEncoding`, and `PartHeaders`.
+`MultipartParser`, `MultipartEvent`, `Parsed`, `MultipartLimits`, `MultipartError`, `PartHead`, `Parts`, `ContentDisposition`, `ParameterRules`, `ContentType`, `ContentTransferEncoding`, and `PartHeaders`.
 
 ## Validation
 

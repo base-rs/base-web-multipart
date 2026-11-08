@@ -1,6 +1,7 @@
 // Released under the MIT License.
 // Copyright, 2026, by Samuel Williams.
 
+use crate::ParameterRules;
 use crate::syntax::{
     PARAMETER_COUNT_LIMIT, field_text, is_field_value_byte, is_token, lowercase,
     parse_parameterized, write_parameter_value,
@@ -11,17 +12,18 @@ use std::fmt;
 
 /// A `Content-Disposition` field, as RFC 2183 defines it for MIME parts and RFC 7578 uses for form data: a disposition type, such as `form-data`, and parameters, such as `name` and `filename`.
 ///
-/// Parsing borrows from the field value, copying only a quoted string with escapes. Names and filenames are returned as they were sent: RFC 7578 lets them be UTF-8, and browsers percent-encode the quotes and line breaks in them, which this type does not decode. In a quoted string, a backslash escapes only a quote or another backslash; any other backslash is kept, since browsers send Windows paths unescaped. The extended `filename*` parameter of RFC 8187 is an ordinary parameter here, not decoded, and is written unquoted.
+/// Parsing borrows from the field value, copying only a quoted string with escapes. Names and filenames are returned as they were sent: RFC 7578 lets them be UTF-8, and browsers percent-encode the quotes and line breaks in them, which this type does not decode. In a quoted string, a backslash escapes only a quote or another backslash; any other backslash is kept, since browsers send Windows paths unescaped. Extended parameters, such as `filename*`, are kept as they were sent by [`parameter`](Self::parameter); [`name`](Self::name) and [`filename`](Self::filename) apply [`ParameterRules`] to them, since forms and other MIME parts treat them differently. They are written unquoted.
 ///
 /// A value that is not UTF-8, as a form on a page in a legacy character set may send, is invalid, as are an empty parameter, such as a trailing `;`, and a value outside quotes that is not a token.
 ///
 /// ```
-/// use base_web_multipart::ContentDisposition;
+/// use base_web_multipart::{ContentDisposition, ParameterRules};
 /// use base_message::FieldType;
 ///
 /// let disposition = ContentDisposition::parse(b"form-data; name=\"avatar\"; filename=\"caf\xc3\xa9.png\"")?;
 /// assert_eq!(disposition.disposition_type(), "form-data");
-/// assert_eq!((disposition.name(), disposition.filename()), (Some("avatar"), Some("café.png")));
+/// assert_eq!(disposition.name(ParameterRules::FormData)?.as_deref(), Some("avatar"));
+/// assert_eq!(disposition.filename(ParameterRules::FormData)?.as_deref(), Some("café.png"));
 ///
 /// let written = ContentDisposition::form_data("note")?.with_parameter("filename", "a \"quoted\" name")?;
 /// assert_eq!(written.to_string(), "form-data; name=\"note\"; filename=\"a \\\"quoted\\\" name\"");
@@ -119,14 +121,66 @@ impl<'a> ContentDisposition<'a> {
             .map(|(name, value)| (&**name, &**value))
     }
 
-    /// The `name` parameter, a form field's name.
-    pub fn name(&self) -> Option<&str> {
-        self.parameter("name")
+    /// The `name` parameter, a form field's name, following these rules for extended parameters.
+    ///
+    /// # Errors
+    ///
+    /// When the rules do not allow the disposition's extended parameters, or an extended `name*` cannot be decoded.
+    pub fn name(&self, rules: ParameterRules) -> Result<Option<Cow<'_, str>>, FieldValueError> {
+        self.resolve("name", rules)
     }
 
-    /// The `filename` parameter, a file's name as the sender gave it, which must not be used as a local path without checking it.
-    pub fn filename(&self) -> Option<&str> {
-        self.parameter("filename")
+    /// The `filename` parameter, a file's name as the sender gave it, following these rules for extended parameters. It must not be used as a local path without checking it.
+    ///
+    /// # Errors
+    ///
+    /// When the rules do not allow the disposition's extended parameters, or an extended `filename*` cannot be decoded.
+    pub fn filename(&self, rules: ParameterRules) -> Result<Option<Cow<'_, str>>, FieldValueError> {
+        self.resolve("filename", rules)
+    }
+
+    /// A parameter's value under these rules. The name is lowercase, as stored parameter names are.
+    fn resolve(
+        &self,
+        name: &str,
+        rules: ParameterRules,
+    ) -> Result<Option<Cow<'_, str>>, FieldValueError> {
+        match rules {
+            ParameterRules::FormData => {
+                // RFC 7578 section 4.2: the RFC 5987 encoding must not be used.
+                if self
+                    .parameters
+                    .iter()
+                    .any(|(parameter, _)| parameter.contains('*'))
+                {
+                    return Err(FieldValueError::new(
+                        "extended parameters are not allowed in form data",
+                    ));
+                }
+            }
+            ParameterRules::Mime => {
+                let mut extended = None;
+                for (parameter, value) in &self.parameters {
+                    match parameter
+                        .strip_prefix(name)
+                        .and_then(|rest| rest.strip_prefix('*'))
+                    {
+                        Some("") => extended = Some(value),
+                        // A continuation, such as `filename*0`, which other readers join; until this one does, refusing it keeps them from disagreeing.
+                        Some(_) => {
+                            return Err(FieldValueError::new(
+                                "parameter continuations are not supported",
+                            ));
+                        }
+                        None => {}
+                    }
+                }
+                if let Some(value) = extended {
+                    return decode_extended_value(value).map(Some);
+                }
+            }
+        }
+        Ok(self.parameter(name).map(Cow::Borrowed))
     }
 
     /// The disposition, owning its text.
@@ -183,4 +237,44 @@ impl fmt::Debug for ContentDisposition<'_> {
             .field("parameters", &parameters)
             .finish()
     }
+}
+
+/// Decodes an RFC 2231 extended value, `charset'language'percent-encoded`, in UTF-8 or US-ASCII, borrowing when nothing is percent-encoded.
+fn decode_extended_value(value: &str) -> Result<Cow<'_, str>, FieldValueError> {
+    let invalid = |reason| Err(FieldValueError::new(reason));
+    let Some((charset, Some((_language, encoded)))) = value
+        .split_once('\'')
+        .map(|(charset, rest)| (charset, rest.split_once('\'')))
+    else {
+        return invalid("extended parameter value has no character set");
+    };
+    let ascii = if charset.eq_ignore_ascii_case("us-ascii") {
+        true
+    } else if charset.eq_ignore_ascii_case("utf-8") {
+        false
+    } else {
+        return invalid("extended parameter value has an unsupported character set");
+    };
+    let mut bytes = Vec::with_capacity(encoded.len());
+    let mut input = encoded.bytes();
+    while let Some(byte) = input.next() {
+        if byte != b'%' {
+            bytes.push(byte);
+            continue;
+        }
+        let digit = |byte: Option<u8>| byte.and_then(|byte| char::from(byte).to_digit(16));
+        match (digit(input.next()), digit(input.next())) {
+            (Some(high), Some(low)) => bytes.push((high * 16 + low) as u8),
+            _ => return invalid("extended parameter value has an invalid percent-encoding"),
+        }
+    }
+    if ascii && !bytes.is_ascii() {
+        return invalid("extended parameter value is not US-ASCII");
+    }
+    if bytes == encoded.as_bytes() {
+        return Ok(Cow::Borrowed(encoded));
+    }
+    String::from_utf8(bytes)
+        .map(Cow::Owned)
+        .map_err(|_| FieldValueError::new("extended parameter value is not UTF-8"))
 }

@@ -9,13 +9,14 @@ use base_message::FieldSection;
 /// Each is a singleton, so a second `Content-Type` or `Content-Disposition` is an error rather than a choice between them. A transfer encoding other than an identity one is an invalid value, since the content would otherwise be misread. Flatten this section into one of your own to read other fields too.
 ///
 /// ```
-/// use base_web_multipart::{PartHead, PartHeaders};
+/// use base_web_multipart::{ParameterRules, PartHead, PartHeaders};
 /// use base_message::FieldSection;
 ///
 /// let headers = PartHeaders::interpret([("Content-Disposition", "form-data; name=\"a\""), ("Content-Type", "text/plain")])?;
-/// assert_eq!(headers.content_disposition.as_ref().and_then(|disposition| disposition.name()), Some("a"));
+/// let disposition = headers.content_disposition.as_ref().expect("a disposition");
+/// assert_eq!(disposition.name(ParameterRules::FormData)?.as_deref(), Some("a"));
 /// assert!(PartHeaders::interpret([("Content-Transfer-Encoding", "base64")]).is_err());
-/// # Ok::<(), base_message::FieldError>(())
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, FieldSection)]
 #[non_exhaustive]

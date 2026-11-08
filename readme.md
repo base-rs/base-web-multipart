@@ -8,15 +8,16 @@ MIME multipart bodies, parsed and written without I/O, following RFC 2046 and RF
 
 ```rust
 use base_message::FieldSection;
-use base_web_multipart::{Boundary, PartHeaders, parts};
+use base_web_multipart::{Boundary, ParameterRules, PartHeaders, parts};
 
 let body = b"--XyZ\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nHello, world\r\n--XyZ--\r\n";
 let boundary = Boundary::new("XyZ")?;
 for part in parts(body, &boundary) {
     let part = part?;
     let headers = PartHeaders::interpret(part.head())?;
-    let name = headers.content_disposition.as_ref().and_then(|disposition| disposition.name());
-    assert_eq!((name, part.content()), (Some("title"), &b"Hello, world"[..]));
+    let disposition = headers.content_disposition.ok_or("a form part has a disposition")?;
+    let name = disposition.name(ParameterRules::FormData)?.ok_or("a form part has a name")?;
+    assert_eq!((&*name, part.content()), ("title", &b"Hello, world"[..]));
 }
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```

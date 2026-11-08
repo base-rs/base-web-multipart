@@ -47,7 +47,7 @@ pub struct Parts<'a> {
 /// The parts of a complete body, with the default limits.
 ///
 /// ```
-/// use base_web_multipart::{Boundary, PartHeaders, parts};
+/// use base_web_multipart::{Boundary, ParameterRules, PartHeaders, parts};
 /// use base_message::FieldSection;
 ///
 /// let body = b"--b\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\none\r\n--b\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\ntwo\r\n--b--";
@@ -56,7 +56,8 @@ pub struct Parts<'a> {
 /// for part in parts(body, &boundary) {
 ///     let part = part?;
 ///     let headers = PartHeaders::interpret(part.head())?;
-///     let name = headers.content_disposition.as_ref().and_then(|disposition| disposition.name()).unwrap_or_default().to_owned();
+///     let disposition = headers.content_disposition.ok_or("a form part has a disposition")?;
+///     let name = disposition.name(ParameterRules::FormData)?.ok_or("a form part has a name")?.into_owned();
 ///     fields.push((name, part.content()));
 /// }
 /// assert_eq!(fields, [("a".to_owned(), &b"one"[..]), ("b".to_owned(), &b"two"[..])]);
