@@ -15,7 +15,7 @@
 pub struct MultipartLimits {
     /// The bytes before the first boundary, which are ignored.
     pub preamble_size_limit: usize,
-    /// The bytes of one part's header section, including its line breaks, and of any padding after the boundary before it.
+    /// The bytes of one part's header section, including its line breaks, and of any padding after the boundary before it. Padding after the closing boundary is limited too.
     pub header_size_limit: usize,
     /// The fields in one part's header section.
     pub header_count_limit: usize,

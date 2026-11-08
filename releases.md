@@ -1,5 +1,10 @@
 # Releases
 
+## Unreleased
+
+- Fix `MultipartParser` reporting the preamble limit, and the header size limit for padding after a boundary, at an offset that depended on how the body was split. They are reported at the start of the preamble and of the padding, as they were for a body given whole.
+- Fix `MultipartParser` refusing a boundary after a bare CR or LF before reporting the content in front of the line break, or counting the preamble there toward its limit, as it does when the body is split before the break.
+
 ## v0.1.0
 
 - Add `MultipartParser`, a sans-I/O parser for multipart bodies following RFC 2046, which is fed bytes as they arrive, reports each part's header section and content borrowed from its input, applies limits on the preamble, header sections, and number of parts, and rejects folded header lines and misplaced boundaries.
