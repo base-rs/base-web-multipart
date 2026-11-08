@@ -115,10 +115,11 @@ fn parameter_value(text: &str) -> Result<(Cow<'_, str>, &str), FieldValueError> 
                 let value = unescaped.map_or(Cow::Borrowed(&quoted[..index]), Cow::Owned);
                 return Ok((value, &quoted[index + 1..]));
             }
-            '\\' => {
+            // A backslash escapes only a quote or another backslash. Browsers do not escape backslashes in names and filenames, so any other is kept, as in a Windows path such as `C:\Users`.
+            '\\' if matches!(quoted[index + 1..].chars().next(), Some('"' | '\\')) => {
                 let (_, escaped) = characters
                     .next()
-                    .ok_or(FieldValueError::new("unterminated quoted string"))?;
+                    .expect("the escaped character was just seen");
                 unescaped
                     .get_or_insert_with(|| quoted[..index].to_owned())
                     .push(escaped);
@@ -133,8 +134,12 @@ fn parameter_value(text: &str) -> Result<(Cow<'_, str>, &str), FieldValueError> 
     Err(FieldValueError::new("unterminated quoted string"))
 }
 
-/// Write a parameter value as a quoted string, escaping quotes and backslashes.
-pub(crate) fn write_quoted(output: &mut String, value: &str) {
+/// Write a parameter value: as a token when its name ends with `*`, since RFC 8187 extended values are never quoted, and otherwise as a quoted string, escaping quotes and backslashes.
+pub(crate) fn write_parameter_value(output: &mut String, name: &str, value: &str) {
+    if name.ends_with('*') {
+        output.push_str(value);
+        return;
+    }
     output.push('"');
     for character in value.chars() {
         if matches!(character, '"' | '\\') {

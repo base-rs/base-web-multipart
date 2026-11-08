@@ -3,6 +3,7 @@
 
 use base_message::{FieldType, FieldValueError, ascii_text, combination::Singleton};
 use base_web_media_type::MediaType;
+use std::fmt;
 
 /// A part's `Content-Type` field: its media type, which RFC 2046 defaults to `text/plain; charset=us-ascii` and RFC 7578 to `text/plain` for form data when the field is absent.
 ///
@@ -33,6 +34,19 @@ impl ContentType {
 impl From<MediaType> for ContentType {
     fn from(media_type: MediaType) -> Self {
         Self(media_type)
+    }
+}
+
+impl From<ContentType> for MediaType {
+    fn from(content_type: ContentType) -> Self {
+        content_type.0
+    }
+}
+
+/// Writes the media type as a field value.
+impl fmt::Display for ContentType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
     }
 }
 

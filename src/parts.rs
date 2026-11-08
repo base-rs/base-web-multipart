@@ -36,7 +36,7 @@ impl fmt::Debug for Part<'_> {
 }
 
 /// The parts of a complete body held in memory, in order, as [`parts`] produces them.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Parts<'a> {
     parser: MultipartParser,
     body: &'a [u8],
@@ -79,7 +79,7 @@ impl<'a> Parts<'a> {
 
     fn next_part(&mut self) -> Result<Option<Part<'a>>, MultipartError> {
         let body = self.body;
-        let (mut head, mut content) = (None, self.position..self.position);
+        let (mut head, mut content, mut start) = (None, self.position..self.position, None);
         loop {
             let parsed = self.parser.parse(&body[self.position..])?;
             self.position += parsed.consumed;
@@ -87,9 +87,12 @@ impl<'a> Parts<'a> {
                 MultipartEvent::Part(part) => {
                     head = Some(part);
                     content = self.position..self.position;
+                    start = None;
                 }
-                // Pieces of one part's content are adjacent in the body.
-                MultipartEvent::Content(_) => content.end = self.position,
+                // Each piece ends where the parser stopped, and pieces of one part's content are adjacent in the body, so the content runs from the first piece's start to the last piece's end.
+                MultipartEvent::Content(piece) => {
+                    content = *start.get_or_insert(self.position - piece.len())..self.position
+                }
                 MultipartEvent::PartEnd => {
                     return Ok(head.map(|head| Part {
                         head,
@@ -101,6 +104,17 @@ impl<'a> Parts<'a> {
                 MultipartEvent::Incomplete => return self.parser.finish().and(Ok(None)),
             }
         }
+    }
+}
+
+/// Shows the position in the body and its length, since the body must not reach logs.
+impl fmt::Debug for Parts<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Parts")
+            .field("position", &self.position)
+            .field("length", &self.body.len())
+            .finish()
     }
 }
 

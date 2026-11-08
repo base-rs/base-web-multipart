@@ -26,12 +26,18 @@ pub enum ContentTransferEncoding {
 
 impl ContentTransferEncoding {
     /// The encoding's name, as it is written.
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::SevenBit => "7bit",
             Self::EightBit => "8bit",
             Self::Binary => "binary",
         }
+    }
+}
+
+impl std::fmt::Display for ContentTransferEncoding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 

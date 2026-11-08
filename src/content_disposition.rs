@@ -3,7 +3,7 @@
 
 use crate::syntax::{
     PARAMETER_COUNT_LIMIT, field_text, is_field_value_byte, is_token, lowercase,
-    parse_parameterized, write_quoted,
+    parse_parameterized, write_parameter_value,
 };
 use base_message::{FieldType, FieldValueError, combination::Singleton};
 use std::borrow::Cow;
@@ -11,7 +11,9 @@ use std::fmt;
 
 /// A `Content-Disposition` field, as RFC 2183 defines it for MIME parts and RFC 7578 uses for form data: a disposition type, such as `form-data`, and parameters, such as `name` and `filename`.
 ///
-/// Parsing borrows from the field value, copying only a quoted string with escapes. Names and filenames are returned as they were sent: RFC 7578 lets them be UTF-8, and browsers percent-encode the quotes and line breaks in them, which this type does not decode. The extended `filename*` parameter of RFC 8187 is an ordinary parameter here, not decoded.
+/// Parsing borrows from the field value, copying only a quoted string with escapes. Names and filenames are returned as they were sent: RFC 7578 lets them be UTF-8, and browsers percent-encode the quotes and line breaks in them, which this type does not decode. In a quoted string, a backslash escapes only a quote or another backslash; any other backslash is kept, since browsers send Windows paths unescaped. The extended `filename*` parameter of RFC 8187 is an ordinary parameter here, not decoded, and is written unquoted.
+///
+/// A value that is not UTF-8, as a form on a page in a legacy character set may send, is invalid, as are an empty parameter, such as a trailing `;`, and a value outside quotes that is not a token.
 ///
 /// ```
 /// use base_web_multipart::ContentDisposition;
@@ -31,13 +33,13 @@ pub struct ContentDisposition<'a> {
     parameters: Vec<(Cow<'a, str>, Cow<'a, str>)>,
 }
 
-impl<'a> ContentDisposition<'a> {
+impl ContentDisposition<'static> {
     /// A disposition without parameters, such as `attachment`. The type is lowercased.
     ///
     /// # Errors
     ///
     /// When the type is not a token.
-    pub fn new(disposition_type: &str) -> Result<ContentDisposition<'static>, FieldValueError> {
+    pub fn new(disposition_type: &str) -> Result<Self, FieldValueError> {
         if !is_token(disposition_type) {
             return Err(FieldValueError::new("disposition type is not a token"));
         }
@@ -52,19 +54,21 @@ impl<'a> ContentDisposition<'a> {
     /// # Errors
     ///
     /// When the name contains a control character, such as CR or LF, which a quoted string cannot carry.
-    pub fn form_data(name: &str) -> Result<ContentDisposition<'static>, FieldValueError> {
+    pub fn form_data(name: &str) -> Result<Self, FieldValueError> {
         ContentDisposition {
             disposition_type: Cow::Borrowed("form-data"),
             parameters: Vec::new(),
         }
         .with_parameter("name", name)
     }
+}
 
+impl<'a> ContentDisposition<'a> {
     /// The disposition with a parameter added. The name is lowercased.
     ///
     /// # Errors
     ///
-    /// When the name is not a token or is already present, the value contains a control character other than horizontal tab, or the disposition already has the most parameters it may have.
+    /// When the name is not a token or is already present, the value contains a control character other than horizontal tab, the name ends with `*`, marking an RFC 8187 extended value, and the value is not a token, or the disposition already has the most parameters it may have.
     pub fn with_parameter(
         mut self,
         name: &str,
@@ -76,6 +80,11 @@ impl<'a> ContentDisposition<'a> {
         if !value.bytes().all(is_field_value_byte) {
             return Err(FieldValueError::new(
                 "parameter value contains a control character",
+            ));
+        }
+        if name.ends_with('*') && !is_token(value) {
+            return Err(FieldValueError::new(
+                "extended parameter value is not a token",
             ));
         }
         let name = lowercase(name).into_owned();
@@ -146,7 +155,7 @@ impl<'a> FieldType<'a> for ContentDisposition<'a> {
     }
 }
 
-/// Writes the disposition as a field value, with every parameter value quoted.
+/// Writes the disposition as a field value, with every parameter value quoted except extended values.
 impl fmt::Display for ContentDisposition<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut text = String::from(&*self.disposition_type);
@@ -154,7 +163,7 @@ impl fmt::Display for ContentDisposition<'_> {
             text.push_str("; ");
             text.push_str(name);
             text.push('=');
-            write_quoted(&mut text, value);
+            write_parameter_value(&mut text, name, value);
         }
         formatter.write_str(&text)
     }

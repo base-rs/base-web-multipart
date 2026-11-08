@@ -6,9 +6,9 @@
 
 - a field name that is not RFC 5322 `ftext`, and a field value with a control character other than horizontal tab, so that no header line can be injected;
 - a header line that begins with the boundary, which would form the delimiter after the preceding line break;
-- content that contains the boundary delimiter, including content that begins with the boundary after the header section's line break and a delimiter split across calls.
+- content that contains the boundary after a line break, whether CRLF or a bare CR or LF, including content that begins with the boundary after the header section's line break and a boundary split across calls.
 
-`Boundary::generate` must draw 192 bits from the operating system's random number generator. A body with no parts must be written as its closing boundary alone.
+`Boundary::generate` must draw 192 bits from the operating system's random number generator. A body with no parts must be written as its closing boundary alone. The writer does not apply a reader's limits, such as on the number of parts, which its documentation must say.
 
 ## Rationale
 

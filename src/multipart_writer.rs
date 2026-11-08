@@ -8,7 +8,9 @@ use std::fmt;
 
 /// A sans-I/O writer for a multipart body, which appends the body's bytes to a caller's buffer, to be sent as the caller chooses.
 ///
-/// It refuses whatever would change the body's structure for a reader: a field name or value that is not valid, which could inject header lines, and a header line or content that contains the boundary delimiter, which would end the part early. A [generated](Boundary::generate) boundary makes content containing it practically impossible, but the check also covers boundaries chosen by the caller.
+/// It refuses whatever would change the body's structure for a reader: a field name or value that is not valid, which could inject header lines, and a header line or content that contains the boundary after a line break, which would end the part early. That includes the boundary after a bare CR or LF, which some readers also take for a delimiter. A [generated](Boundary::generate) boundary makes content containing it practically impossible, but the check also covers boundaries chosen by the caller.
+///
+/// The writer does not apply a reader's limits: a body with more parts or header fields than a reader allows, such as [`MultipartLimits`](crate::MultipartLimits)'s defaults, is written, and that reader refuses it.
 ///
 /// ```
 /// use base_web_multipart::{Boundary, ContentDisposition, MultipartWriter};
@@ -27,6 +29,7 @@ pub struct MultipartWriter {
     boundary: Boundary,
     /// `CRLF "--" boundary`, which ends a part's content.
     delimiter: Vec<u8>,
+    /// Finds `"--" boundary`, so that what precedes it can be checked.
     finder: Finder<'static>,
     state: State,
 }
@@ -35,8 +38,8 @@ pub struct MultipartWriter {
 enum State {
     /// No part has started.
     Start,
-    /// In a part's content, with the bytes of the delimiter its last bytes match, which the next content must not complete.
-    Content { matched: usize },
+    /// In a part's content. When its last bytes are a line break and the start of `"--" boundary`, the bytes of `"--" boundary` they match, which the next content must not complete.
+    Content { matched: Option<usize> },
 }
 
 /// Why a writer refused to write.
@@ -47,7 +50,7 @@ pub enum MultipartWriteError {
     InvalidFieldName,
     /// A field value has a control character other than horizontal tab, such as CR or LF.
     InvalidFieldValue,
-    /// A header line or content contains the boundary delimiter, so a reader would see the part end there.
+    /// A header line or content contains the boundary after a line break, so a reader would see the part end there.
     Delimiter,
     /// Content was written before any part started.
     NoPart,
@@ -57,7 +60,7 @@ impl MultipartWriter {
     /// A writer for a body with this boundary.
     pub fn new(boundary: Boundary) -> Self {
         let delimiter = [b"\r\n--", boundary.as_str().as_bytes()].concat();
-        let finder = Finder::new(&delimiter).into_owned();
+        let finder = Finder::new(&delimiter[2..]).into_owned();
         Self {
             boundary,
             delimiter,
@@ -128,8 +131,8 @@ impl MultipartWriter {
             output.extend_from_slice(b"\r\n");
         }
         output.extend_from_slice(b"\r\n");
-        // The content follows the line break that ends the header section, the delimiter's first two bytes.
-        self.state = State::Content { matched: 2 };
+        // The content follows the line break that ends the header section.
+        self.state = State::Content { matched: Some(0) };
         Ok(())
     }
 
@@ -137,7 +140,7 @@ impl MultipartWriter {
     ///
     /// # Errors
     ///
-    /// When no part has started, or the content, with the content before it, contains the boundary delimiter. Nothing is written, and the writer is unchanged.
+    /// When no part has started, or the content, with the content before it, contains the boundary after a line break. Nothing is written, and the writer is unchanged.
     pub fn write_content(
         &mut self,
         content: &[u8],
@@ -163,26 +166,35 @@ impl MultipartWriter {
         output.extend_from_slice(b"--\r\n");
     }
 
-    /// The delimiter bytes the content's end matches, given those the content before it matched, or an error when it contains the delimiter. The delimiter's only CR is its first byte, so no match can begin inside another.
-    fn scan(&self, matched: usize, content: &[u8]) -> Result<usize, MultipartWriteError> {
-        if matched > 0 {
-            let remaining = &self.delimiter[matched..];
-            let length = remaining.len().min(content.len());
-            if content[..length] == remaining[..length] {
-                if length == remaining.len() {
-                    return Err(MultipartWriteError::Delimiter);
-                }
-                return Ok(matched + length);
-            }
+    /// The bytes of `"--" boundary` that follow the last line break at the end of the content, given those the content before it matched, or an error when the content completes `"--" boundary` after a line break. `"--" boundary` contains no line break, so a match can only begin right after one.
+    fn scan(
+        &self,
+        matched: Option<usize>,
+        content: &[u8],
+    ) -> Result<Option<usize>, MultipartWriteError> {
+        let dash_boundary = &self.delimiter[2..];
+        let continues = |matched: usize, after: &[u8]| {
+            let remaining = &dash_boundary[matched..];
+            let length = remaining.len().min(after.len());
+            (after[..length] == remaining[..length]).then_some(matched + length)
+        };
+        if let Some(matched) = matched.and_then(|matched| continues(matched, content)) {
+            return if matched == dash_boundary.len() {
+                Err(MultipartWriteError::Delimiter)
+            } else {
+                Ok(Some(matched))
+            };
         }
-        if self.finder.find(content).is_some() {
+        if self
+            .finder
+            .find_iter(content)
+            .any(|index| index > 0 && matches!(content[index - 1], b'\r' | b'\n'))
+        {
             return Err(MultipartWriteError::Delimiter);
         }
-        let start = content.len().saturating_sub(self.delimiter.len() - 1);
-        let partial = memchr::memchr_iter(b'\r', &content[start..])
-            .map(|index| start + index)
-            .find(|&index| self.delimiter.starts_with(&content[index..]));
-        Ok(partial.map_or(0, |index| content.len() - index))
+        let start = content.len().saturating_sub(dash_boundary.len());
+        Ok(memchr::memchr2_iter(b'\r', b'\n', &content[start..])
+            .find_map(|index| continues(0, &content[start + index + 1..])))
     }
 }
 
