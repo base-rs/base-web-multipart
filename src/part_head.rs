@@ -23,7 +23,7 @@ impl<'a> PartHead<'a> {
         PartFields { rest: self.section }
     }
 
-    /// The number of fields.
+    /// The number of fields, counted by reading the section.
     pub fn len(&self) -> usize {
         self.fields().count()
     }
@@ -62,9 +62,19 @@ impl<'a> IntoIterator for PartHead<'a> {
 }
 
 /// The fields of a [`PartHead`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PartFields<'a> {
     rest: &'a [u8],
+}
+
+/// Shows the length of the remaining header section, since field values must not reach logs.
+impl fmt::Debug for PartFields<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PartFields")
+            .field("remaining", &format_args!("<{} bytes>", self.rest.len()))
+            .finish()
+    }
 }
 
 impl<'a> Iterator for PartFields<'a> {

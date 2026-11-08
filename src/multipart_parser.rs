@@ -36,6 +36,7 @@ use memchr::memmem::Finder;
 pub struct MultipartParser {
     /// `CRLF "--" boundary`, which ends a part's content.
     delimiter: Vec<u8>,
+    /// Finds `"--" boundary`, wherever it appears, so that what precedes it can be checked.
     finder: Finder<'static>,
     limits: MultipartLimits,
     state: State,
@@ -43,6 +44,8 @@ pub struct MultipartParser {
     offset: u64,
     preamble_size: usize,
     part_count: usize,
+    /// The error the parser reported, which it reports again for every later call.
+    failed: Option<MultipartError>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,12 +58,29 @@ enum State {
     Delimiter {
         padding: usize,
     },
-    /// In a part's header section, with the bytes of the input already searched for its end.
+    /// After `--` that closes the body, with the spaces and tabs consumed so far, before the line break that ends the closing boundary.
+    Closing {
+        padding: usize,
+    },
+    /// In a part's header section, with the padding after its boundary, which counts toward its size, and the bytes of the input already searched for its end.
     Headers {
+        padding: usize,
         searched: usize,
     },
+    /// At the empty line that ends a part's header section, whose line break may also begin the delimiter of a part with no content.
+    BodyStart,
     Content,
     End,
+}
+
+/// A `"--" boundary` in the input, classified by what precedes it.
+enum Found {
+    /// Preceded by CRLF: a delimiter, starting at the CR.
+    Delimiter(usize),
+    /// Preceded by a bare CR or LF, at this position, which some readers take for a delimiter.
+    Bare(usize),
+    /// Not in the input.
+    Absent,
 }
 
 impl MultipartParser {
@@ -72,7 +92,7 @@ impl MultipartParser {
     /// A parser for a body with this boundary and these limits.
     pub fn with_limits(boundary: &Boundary, limits: MultipartLimits) -> Self {
         let delimiter = [b"\r\n--", boundary.as_str().as_bytes()].concat();
-        let finder = Finder::new(&delimiter).into_owned();
+        let finder = Finder::new(&delimiter[2..]).into_owned();
         Self {
             delimiter,
             finder,
@@ -81,6 +101,7 @@ impl MultipartParser {
             offset: 0,
             preamble_size: 0,
             part_count: 0,
+            failed: None,
         }
     }
 
@@ -91,10 +112,13 @@ impl MultipartParser {
 
     /// The input a caller must be able to buffer: given at least this many bytes, [`Self::parse`] always consumes some or reports an event other than [`MultipartEvent::Incomplete`].
     pub fn minimum_buffer_size(&self) -> usize {
-        (self.limits.header_size_limit + 3).max(self.delimiter.len())
+        self.limits
+            .header_size_limit
+            .saturating_add(2)
+            .max(self.delimiter.len())
     }
 
-    /// Whether the closing boundary has been reached.
+    /// Whether the closing boundary line has been read, so that [`MultipartEvent::End`] was reported.
     pub fn is_finished(&self) -> bool {
         self.state == State::End
     }
@@ -103,29 +127,40 @@ impl MultipartParser {
     ///
     /// # Errors
     ///
-    /// A [`MultipartError`] when the body is malformed or exceeds a limit. The parser should not be used after an error.
+    /// A [`MultipartError`] when the body is malformed or exceeds a limit. Once the parser reports an error, it reports the same error for every later call.
     pub fn parse<'a>(&mut self, input: &'a [u8]) -> Result<Parsed<'a>, MultipartError> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
         let mut consumed = 0;
-        let event = self
-            .step(input, &mut consumed)
-            .map_err(|kind| MultipartError::new(kind, self.offset + consumed as u64))?;
-        self.offset += consumed as u64;
-        Ok(Parsed { consumed, event })
+        match self.step(input, &mut consumed) {
+            Ok(event) => {
+                self.offset += consumed as u64;
+                Ok(Parsed { consumed, event })
+            }
+            Err(kind) => {
+                let error = MultipartError::new(kind, self.offset + consumed as u64);
+                self.failed = Some(error);
+                Err(error)
+            }
+        }
     }
 
-    /// Check that the body was complete, once its input has ended.
+    /// Check that the body was complete, once its input has ended. A body may end immediately after its closing `--`, without a line break.
     ///
     /// # Errors
     ///
-    /// [`MultipartErrorKind::UnexpectedEnd`] when the closing boundary was not reached.
+    /// The parser's error, if it reported one, or [`MultipartErrorKind::UnexpectedEnd`] when the closing boundary was not reached.
     pub fn finish(&self) -> Result<(), MultipartError> {
-        if self.is_finished() {
-            Ok(())
-        } else {
-            Err(MultipartError::new(
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        match self.state {
+            State::End | State::Closing { .. } => Ok(()),
+            _ => Err(MultipartError::new(
                 MultipartErrorKind::UnexpectedEnd,
                 self.offset,
-            ))
+            )),
         }
     }
 
@@ -149,11 +184,15 @@ impl MultipartParser {
                     }
                 }
                 State::Preamble => {
-                    let (skipped, found) = match self.finder.find(rest) {
-                        Some(index) => (index, true),
-                        None => (safe_length(rest, &self.delimiter), false),
+                    let (skipped, found) = match self.find(rest) {
+                        Found::Delimiter(index) => (index, true),
+                        Found::Bare(index) => {
+                            *consumed += index;
+                            return Err(MultipartErrorKind::InvalidDelimiter);
+                        }
+                        Found::Absent => (self.safe_length(rest), false),
                     };
-                    self.preamble_size += skipped;
+                    self.preamble_size = self.preamble_size.saturating_add(skipped);
                     if self.preamble_size > self.limits.preamble_size_limit {
                         return Err(MultipartErrorKind::PreambleSizeLimit);
                     }
@@ -167,78 +206,109 @@ impl MultipartParser {
                 State::Delimiter { padding } => {
                     if padding == 0 && rest.starts_with(b"--") {
                         *consumed += 2;
-                        self.state = State::End;
-                        return Ok(MultipartEvent::End);
+                        self.state = State::Closing { padding: 0 };
+                        continue;
                     }
-                    let spaces = rest
-                        .iter()
-                        .take_while(|&&byte| byte == b' ' || byte == b'\t')
-                        .count();
-                    let padding = padding + spaces;
-                    if padding > self.limits.header_size_limit {
-                        return Err(MultipartErrorKind::HeaderSizeLimit);
-                    }
-                    *consumed += spaces;
+                    let padding = self.pad(rest, padding, consumed)?;
                     self.state = State::Delimiter { padding };
-                    let rest = &rest[spaces..];
+                    let rest = &input[*consumed..];
                     if rest.starts_with(b"\r\n") {
                         self.part_count += 1;
                         if self.part_count > self.limits.part_count_limit {
                             return Err(MultipartErrorKind::PartCountLimit);
                         }
                         *consumed += 2;
-                        self.state = State::Headers { searched: 0 };
+                        self.state = State::Headers {
+                            padding,
+                            searched: 0,
+                        };
                     } else if rest.is_empty() || rest == b"\r" || (padding == 0 && rest == b"-") {
                         return Ok(MultipartEvent::Incomplete);
                     } else {
                         return Err(MultipartErrorKind::InvalidDelimiter);
                     }
                 }
-                State::Headers { searched } => {
-                    let section = if rest.starts_with(b"\r\n") {
+                State::Closing { padding } => {
+                    let padding = self.pad(rest, padding, consumed)?;
+                    self.state = State::Closing { padding };
+                    let rest = &input[*consumed..];
+                    if rest.starts_with(b"\r\n") {
+                        *consumed += 2;
+                        self.state = State::End;
+                        return Ok(MultipartEvent::End);
+                    } else if rest.is_empty() || rest == b"\r" {
+                        // The body may also end here, which `finish` accepts.
+                        return Ok(MultipartEvent::Incomplete);
+                    } else {
+                        return Err(MultipartErrorKind::InvalidDelimiter);
+                    }
+                }
+                State::Headers { padding, searched } => {
+                    // The padding after the boundary counts toward the header section's size.
+                    let limit = self.limits.header_size_limit - padding;
+                    let length = if rest.starts_with(b"\r\n") {
                         Some(0)
                     } else {
-                        let start = searched.saturating_sub(3);
+                        let start = searched.saturating_sub(3).min(rest.len());
                         memchr::memmem::find(&rest[start..], b"\r\n\r\n")
                             .map(|index| start + index + 2)
                     };
-                    let Some(length) = section else {
-                        if rest.len() > self.limits.header_size_limit + 2 {
+                    let Some(length) = length else {
+                        // A section within the limit ends within its length and the empty line's CRLF.
+                        if rest.len() >= limit.saturating_add(2) {
                             return Err(MultipartErrorKind::HeaderSizeLimit);
                         }
                         self.state = State::Headers {
+                            padding,
                             searched: rest.len(),
                         };
                         return Ok(MultipartEvent::Incomplete);
                     };
-                    if length > self.limits.header_size_limit {
+                    if length > limit {
                         return Err(MultipartErrorKind::HeaderSizeLimit);
                     }
                     let section = &rest[..length];
                     self.check_section(section)?;
-                    *consumed += length + 2;
-                    self.state = State::Content;
+                    *consumed += length;
+                    self.state = State::BodyStart;
                     return Ok(MultipartEvent::Part(PartHead::new(section)));
                 }
+                State::BodyStart => {
+                    // RFC 2046 makes the content `[CRLF *OCTET]`, so the empty line's CRLF is also the delimiter's when the part has no content.
+                    if rest.starts_with(&self.delimiter) {
+                        *consumed += self.delimiter.len();
+                        self.state = State::Delimiter { padding: 0 };
+                        return Ok(MultipartEvent::PartEnd);
+                    }
+                    if rest.len() < self.delimiter.len() && self.delimiter.starts_with(rest) {
+                        return Ok(MultipartEvent::Incomplete);
+                    }
+                    *consumed += 2;
+                    self.state = State::Content;
+                }
                 State::Content => {
-                    return Ok(match self.finder.find(rest) {
-                        Some(0) => {
+                    return match self.find(rest) {
+                        Found::Delimiter(0) => {
                             *consumed += self.delimiter.len();
                             self.state = State::Delimiter { padding: 0 };
-                            MultipartEvent::PartEnd
+                            Ok(MultipartEvent::PartEnd)
                         }
-                        Some(index) => {
+                        Found::Delimiter(index) => {
                             *consumed += index;
-                            MultipartEvent::Content(&rest[..index])
+                            Ok(MultipartEvent::Content(&rest[..index]))
                         }
-                        None => match safe_length(rest, &self.delimiter) {
-                            0 => MultipartEvent::Incomplete,
+                        Found::Bare(index) => {
+                            *consumed += index;
+                            Err(MultipartErrorKind::InvalidDelimiter)
+                        }
+                        Found::Absent => match self.safe_length(rest) {
+                            0 => Ok(MultipartEvent::Incomplete),
                             length => {
                                 *consumed += length;
-                                MultipartEvent::Content(&rest[..length])
+                                Ok(MultipartEvent::Content(&rest[..length]))
                             }
                         },
-                    });
+                    };
                 }
                 State::End => {
                     // The epilogue is ignored.
@@ -247,6 +317,53 @@ impl MultipartParser {
                 }
             }
         }
+    }
+
+    /// Consume the spaces and tabs of transport padding after a boundary, which count toward the header size limit.
+    fn pad(
+        &self,
+        rest: &[u8],
+        padding: usize,
+        consumed: &mut usize,
+    ) -> Result<usize, MultipartErrorKind> {
+        let spaces = rest
+            .iter()
+            .take_while(|&&byte| byte == b' ' || byte == b'\t')
+            .count();
+        let padding = padding + spaces;
+        if padding > self.limits.header_size_limit {
+            return Err(MultipartErrorKind::HeaderSizeLimit);
+        }
+        *consumed += spaces;
+        Ok(padding)
+    }
+
+    /// The first `"--" boundary` in `input` that follows a line break. One after CRLF is a delimiter; one after a bare CR or LF is an error, since some readers take it for a delimiter; others are content.
+    fn find(&self, input: &[u8]) -> Found {
+        let mut from = 0;
+        while let Some(index) = self.finder.find(&input[from..]).map(|index| from + index) {
+            if index >= 2 && &input[index - 2..index] == b"\r\n" {
+                return Found::Delimiter(index - 2);
+            }
+            if index >= 1 && matches!(input[index - 1], b'\r' | b'\n') {
+                return Found::Bare(index - 1);
+            }
+            from = index + 1;
+        }
+        Found::Absent
+    }
+
+    /// The bytes at the start of `input` that cannot be part of a boundary still arriving: everything before the first line break from which the rest could become `CRLF "--" boundary`, or a boundary after a bare line break.
+    fn safe_length(&self, input: &[u8]) -> usize {
+        let dash_boundary = &self.delimiter[2..];
+        let start = input.len().saturating_sub(self.delimiter.len() - 1);
+        memchr::memchr2_iter(b'\r', b'\n', &input[start..])
+            .map(|index| start + index)
+            .find(|&index| {
+                self.delimiter.starts_with(&input[index..])
+                    || dash_boundary.starts_with(&input[index + 1..])
+            })
+            .unwrap_or(input.len())
     }
 
     /// Check each line of a header section, which ends with CRLF and has no empty line.
@@ -277,13 +394,4 @@ impl MultipartParser {
         }
         Ok(())
     }
-}
-
-/// The bytes at the start of `input` that cannot be the beginning of `delimiter`, which begins with CR and contains no other: everything before the last CR from which the rest of the input could still become the delimiter.
-fn safe_length(input: &[u8], delimiter: &[u8]) -> usize {
-    let start = input.len().saturating_sub(delimiter.len() - 1);
-    memchr::memchr_iter(b'\r', &input[start..])
-        .map(|index| start + index)
-        .find(|&index| delimiter.starts_with(&input[index..]))
-        .unwrap_or(input.len())
 }

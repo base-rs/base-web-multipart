@@ -142,9 +142,9 @@ fn reports_events_and_ignores_the_epilogue() {
     assert_eq!(parser.limits(), MultipartLimits::default());
     assert_eq!(
         parser.minimum_buffer_size(),
-        MultipartLimits::HEADER_SIZE_LIMIT + 3
+        MultipartLimits::HEADER_SIZE_LIMIT + 2
     );
-    let mut input: &[u8] = b"--b\r\n\r\ndata\r\n--b--tail";
+    let mut input: &[u8] = b"--b\r\n\r\ndata\r\n--b--\r\ntail";
     let mut events = Vec::new();
     loop {
         let parsed = parser.parse(input).unwrap();
@@ -217,10 +217,22 @@ fn waits_for_input_that_could_still_form_a_boundary() {
     assert!(
         matches!(parsed.event, MultipartEvent::Part(head) if head.len() == 1 && !head.is_empty())
     );
-    let parsed = parser.parse(b"ab\r\n--bou").unwrap();
+    assert_eq!(
+        parsed.consumed, 13,
+        "the empty line is left, since it may begin a delimiter"
+    );
+    for start in [&b"\r\n"[..], b"\r\n--bo"] {
+        let parsed = parser.clone().parse(start).unwrap();
+        assert_eq!(
+            (parsed.consumed, parsed.event),
+            (0, MultipartEvent::Incomplete),
+            "{start:?}"
+        );
+    }
+    let parsed = parser.parse(b"\r\nab\r\n--bou").unwrap();
     assert_eq!(
         (parsed.consumed, parsed.event),
-        (2, MultipartEvent::Content(b"ab")),
+        (4, MultipartEvent::Content(b"ab")),
         "the possible delimiter is held back"
     );
     let parsed = parser.parse(b"\r\n--bou").unwrap();
@@ -320,7 +332,7 @@ fn rejects_malformed_bodies_with_their_offsets() {
     let error = collect("b", limits, &[b"--b\r\n\r\n"]).unwrap_err();
     assert_eq!(
         error.to_string(),
-        "multipart body ends before its closing boundary at byte 7"
+        "multipart body ends before its closing boundary at byte 5"
     );
     let error: Box<dyn std::error::Error> = Box::new(error);
     assert!(error.source().is_none());
@@ -490,4 +502,161 @@ fn every_error_describes_itself() {
         assert_eq!(error.kind(), kind);
         assert!(error.to_string().starts_with(description), "{error}");
     }
+}
+
+#[test]
+fn a_part_with_no_content_ends_at_the_empty_line() {
+    // The empty line's CRLF also begins the delimiter, so a boundary straight after the header section ends the part, as other readers see it.
+    let smuggled = b"--b\r\nX: y\r\n\r\n--b\r\nContent-Disposition: form-data; name=\"evil\"\r\n\r\nhello\r\n--b--\r\n";
+    let parts = assert_split_invariant("b", smuggled);
+    assert_eq!(parts.len(), 2);
+    assert_eq!((parts[0].0.len(), parts[0].1.as_slice()), (1, &b""[..]));
+    assert_eq!(parts[1].1, b"hello");
+    assert_eq!(
+        assert_split_invariant("b", b"--b\r\n\r\n--b\r\n\r\nx\r\n--b--").len(),
+        2,
+        "with no fields either"
+    );
+    assert_eq!(
+        assert_split_invariant("b", b"--b\r\nX: y\r\n\r\n--b--"),
+        [(vec![("X".to_owned(), b"y".to_vec())], Vec::new())]
+    );
+}
+
+#[test]
+fn rejects_a_boundary_after_a_bare_line_break() {
+    // Some readers take a boundary after a bare LF or CR for a delimiter, so it is an error rather than content or preamble.
+    let cases: [(&[u8], u64); 5] = [
+        (b"junk\n--b\r\nX: smuggled\r\n\r\nevil\r\n--b--", 4),
+        (b"junk\r--b\r\n\r\n\r\n--b--", 4),
+        (b"--b\r\n\r\nx\n--b\r\nX: role\r\n\r\nadmin\r\n--b--", 8),
+        (b"--b\r\n\r\n\n--b--", 7),
+        (b"--b\r\n\r\nx\r\r--b--", 9),
+    ];
+    for (body, offset) in cases {
+        assert_eq!(
+            error("b", MultipartLimits::default(), body),
+            (MultipartErrorKind::InvalidDelimiter, offset),
+            "{:?}",
+            String::from_utf8_lossy(body)
+        );
+        for split in 0..=body.len() {
+            let (first, second) = body.split_at(split);
+            assert_eq!(
+                collect("b", MultipartLimits::default(), &[first, second])
+                    .unwrap_err()
+                    .kind(),
+                MultipartErrorKind::InvalidDelimiter,
+                "split at {split}"
+            );
+        }
+    }
+    // A boundary after any other byte is content.
+    assert_eq!(
+        assert_split_invariant("b", b"--b\r\n\r\nx--b \n-\r--\r\n-\n\r\n--b--")[0].1,
+        b"x--b \n-\r--\r\n-\n"
+    );
+}
+
+#[test]
+fn checks_the_closing_boundary_line() {
+    assert_eq!(
+        error(
+            "b",
+            MultipartLimits::default(),
+            b"--b--garbage\r\n--b\r\nX: y\r\n\r\n"
+        ),
+        (MultipartErrorKind::InvalidDelimiter, 5)
+    );
+    assert_eq!(
+        assert_split_invariant("b", b"--b\r\n\r\nx\r\n--b-- \t\r\nepilogue"),
+        [(Vec::new(), b"x".to_vec())]
+    );
+    // A body may end immediately after its closing `--`, which `finish` accepts.
+    let mut parser = MultipartParser::new(&Boundary::new("b").unwrap());
+    assert_eq!(
+        parser.parse(b"--b--").unwrap().event,
+        MultipartEvent::Incomplete
+    );
+    assert!(!parser.is_finished());
+    assert!(parser.finish().is_ok());
+    assert_eq!(
+        parser.parse(b"\r").unwrap().event,
+        MultipartEvent::Incomplete
+    );
+    assert_eq!(parser.parse(b"\r\n").unwrap().event, MultipartEvent::End);
+    assert!(parser.is_finished());
+}
+
+#[test]
+fn reports_an_error_again_once_it_has_failed() {
+    let mut parser = MultipartParser::new(&Boundary::new("b").unwrap());
+    let error = parser.parse(b"--bX").unwrap_err();
+    assert_eq!(parser.parse(b"--b--\r\n").unwrap_err(), error);
+    assert_eq!(parser.finish().unwrap_err(), error);
+}
+
+#[test]
+fn handles_unlimited_limits_and_shorter_input() {
+    let unlimited = MultipartLimits {
+        preamble_size_limit: usize::MAX,
+        header_size_limit: usize::MAX,
+        header_count_limit: usize::MAX,
+        part_count_limit: usize::MAX,
+    };
+    assert_eq!(
+        collect(
+            "b",
+            unlimited,
+            &[b"preamble\r\n--b\r\nA: 1\r\n", b"\r\nx\r\n--b--"]
+        )
+        .unwrap()
+        .len(),
+        1
+    );
+    let parser = MultipartParser::with_limits(&Boundary::new("b").unwrap(), unlimited);
+    assert_eq!(parser.minimum_buffer_size(), usize::MAX);
+    // Input that does not begin with the unconsumed bytes breaks the contract, but does not panic.
+    let mut parser = MultipartParser::new(&Boundary::new("b").unwrap());
+    parser.parse(b"--b\r\n").unwrap();
+    assert_eq!(
+        parser.parse(b"A: long value without an end").unwrap().event,
+        MultipartEvent::Incomplete
+    );
+    assert_eq!(
+        parser.parse(b"\r\n\r\n").unwrap().event,
+        MultipartEvent::Part(
+            base_web_multipart::parts(b"--b\r\n\r\n\r\n--b--", &Boundary::new("b").unwrap())
+                .next()
+                .unwrap()
+                .unwrap()
+                .head()
+        )
+    );
+}
+
+#[test]
+fn padding_counts_toward_the_header_section() {
+    let limits = MultipartLimits {
+        header_size_limit: 10,
+        ..MultipartLimits::default()
+    };
+    assert!(
+        collect("b", limits, &[b"--b    \r\nA: 1\r\n\r\n\r\n--b--"]).is_ok(),
+        "4 bytes of padding and a 6-byte section"
+    );
+    assert_eq!(
+        error("b", limits, b"--b     \r\nA: 1\r\n\r\n\r\n--b--"),
+        (MultipartErrorKind::HeaderSizeLimit, 10)
+    );
+    assert_eq!(
+        error("b", limits, b"--b     \r\nA: 1234"),
+        (MultipartErrorKind::HeaderSizeLimit, 10),
+        "found before the section ends"
+    );
+    assert_eq!(
+        error("b", limits, b"--b--           \r\n"),
+        (MultipartErrorKind::HeaderSizeLimit, 5),
+        "padding after the closing boundary is limited too"
+    );
 }

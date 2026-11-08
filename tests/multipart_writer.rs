@@ -177,3 +177,36 @@ fn errors_describe_themselves() {
             .contains("MultipartWriter")
     );
 }
+
+#[test]
+fn refuses_the_boundary_after_a_bare_line_break_however_it_is_split() {
+    let boundary = Boundary::new("b").unwrap();
+    for content in [&b"x\n--b\r\nX: smuggled"[..], b"x\r--b", b"\n--b"] {
+        for split in 0..=content.len() {
+            let mut writer = MultipartWriter::new(boundary.clone());
+            let mut body = Vec::new();
+            writer.start_part([("A", "1")], &mut body).unwrap();
+            let (first, second) = content.split_at(split);
+            let results = [
+                writer.write_content(first, &mut body),
+                writer.write_content(second, &mut body),
+            ];
+            assert!(
+                results.contains(&Err(MultipartWriteError::Delimiter)),
+                "{content:?} split at {split}"
+            );
+        }
+    }
+    // After any other byte, the boundary is content.
+    let mut writer = MultipartWriter::new(boundary.clone());
+    let mut body = Vec::new();
+    writer.start_part([("A", "1")], &mut body).unwrap();
+    for chunk in [&b"x--b"[..], b"\n-", b"-c", b"\r", b"\n--", b"x"] {
+        writer.write_content(chunk, &mut body).unwrap();
+    }
+    writer.finish(&mut body);
+    assert_eq!(
+        parts(&body, &boundary).next().unwrap().unwrap().content(),
+        b"x--b\n--c\r\n--x"
+    );
+}

@@ -270,3 +270,74 @@ fn interprets_part_headers_from_a_body() {
         PartHeaders::interpret(std::iter::empty::<(&str, &str)>()).unwrap()
     );
 }
+
+#[test]
+fn keeps_backslashes_that_escape_nothing() {
+    // Browsers send Windows paths without escaping their backslashes.
+    let parsed =
+        disposition(b"form-data; name=\"upload\"; filename=\"C:\\Users\\me\\a.txt\"").unwrap();
+    assert_eq!(parsed.filename(), Some("C:\\Users\\me\\a.txt"));
+    let parsed = disposition(b"form-data; name=\"a \\\"b\\\" \\\\ \\c\"").unwrap();
+    assert_eq!(
+        parsed.name(),
+        Some("a \"b\" \\ \\c"),
+        "only a quote or backslash is escaped"
+    );
+    assert_eq!(
+        disposition(parsed.to_string().as_bytes()).unwrap(),
+        parsed,
+        "what is written parses back"
+    );
+    // A name ending in a backslash escapes its closing quote, as in other readers, so the value does not end where a browser meant it to.
+    assert_eq!(
+        disposition(b"form-data; name=\"a\\\"; filename=\"b\"")
+            .unwrap_err()
+            .reason(),
+        "expected a parameter separator"
+    );
+}
+
+#[test]
+fn writes_extended_parameters_unquoted() {
+    let parsed = disposition(b"attachment; filename*=UTF-8''caf%C3%A9.txt").unwrap();
+    assert_eq!(parsed.parameter("filename*"), Some("UTF-8''caf%C3%A9.txt"));
+    assert_eq!(
+        parsed.to_string(),
+        "attachment; filename*=UTF-8''caf%C3%A9.txt"
+    );
+    let written = ContentDisposition::new("attachment")
+        .unwrap()
+        .with_parameter("filename*", "UTF-8''a%20b")
+        .unwrap();
+    assert_eq!(written.to_string(), "attachment; filename*=UTF-8''a%20b");
+    let error = ContentDisposition::new("attachment")
+        .unwrap()
+        .with_parameter("filename*", "not a token")
+        .unwrap_err();
+    assert_eq!(error.reason(), "extended parameter value is not a token");
+}
+
+#[test]
+fn converts_and_writes_field_values() {
+    let content_type = ContentType::parse(b"text/plain; charset=utf-8").unwrap();
+    assert_eq!(content_type.to_string(), "text/plain; charset=utf-8");
+    assert_eq!(MediaType::from(content_type).essence(), "text/plain");
+    assert_eq!(ContentTransferEncoding::EightBit.to_string(), "8bit");
+    let boundary: Boundary = "abc".parse().unwrap();
+    assert_eq!(boundary.as_ref(), "abc");
+    assert!("".parse::<Boundary>().is_err());
+}
+
+#[test]
+fn debug_output_of_iterators_shows_no_content() {
+    let body = b"--b\r\nX-Secret: hunter2\r\n\r\npassword\r\n--b--";
+    let boundary = Boundary::new("b").unwrap();
+    let mut iterator = parts(body, &boundary);
+    assert_eq!(format!("{iterator:?}"), "Parts { position: 0, length: 41 }");
+    let part = iterator.next().unwrap().unwrap();
+    assert_eq!(
+        format!("{:?}", part.head().fields()),
+        "PartFields { remaining: <19 bytes> }"
+    );
+    assert!(!format!("{iterator:?}{:?}", part.head().fields()).contains("hunter2"));
+}

@@ -99,7 +99,7 @@ assert_eq!(error.kind(), MultipartErrorKind::PartCountLimit);
 
 Content is not limited here. Limits on fields and uploads belong to whatever consumes the content, such as `base-web-content`'s forms.
 
-The parser is strict where leniency would let two readers see different parts. Every line must end with CRLF; a folded header line is an error; a header name must be a valid field name; and a boundary must be followed only by optional spaces and tabs and a line break, or by `--`. A boundary appearing in content where RFC 2046 does not allow it is therefore an error rather than something to guess about. Errors report the offset in the body and never repeat its bytes.
+The parser is strict where leniency would let two readers see different parts. Every line must end with CRLF; a folded header line is an error; a header name must be a valid field name; a boundary must be followed only by optional spaces and tabs and a line break, or by `--`; and a boundary after a bare CR or LF, which some readers take for a delimiter, is an error. A boundary appearing in content where RFC 2046 does not allow it is therefore an error rather than something to guess about. A body may end immediately after its closing `--`; `finish` accepts it. Errors report the offset in the body and never repeat its bytes, and a parser that has reported an error reports it again.
 
 ## Writing a body
 
@@ -127,4 +127,4 @@ assert!(content_type.to_string().starts_with("multipart/form-data; boundary="));
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-The writer refuses whatever would change the body's structure for a reader: a field name or value with a line break or other control character, which could inject header lines, and a header line or content containing the boundary delimiter, even split across calls. A refused call writes nothing and leaves the writer as it was.
+The writer refuses whatever would change the body's structure for a reader: a field name or value with a line break or other control character, which could inject header lines, and a header line or content containing the boundary after a line break, even split across calls. A refused call writes nothing and leaves the writer as it was. The writer does not apply a reader's limits, so keep the number of parts and fields within what your readers accept.

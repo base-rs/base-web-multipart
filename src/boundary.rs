@@ -107,6 +107,20 @@ impl Boundary {
     }
 }
 
+impl std::str::FromStr for Boundary {
+    type Err = BoundaryError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Self::new(text)
+    }
+}
+
+impl AsRef<str> for Boundary {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 impl fmt::Debug for Boundary {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.debug_tuple("Boundary").field(&self.0).finish()
