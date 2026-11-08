@@ -287,6 +287,7 @@ impl MultipartParser {
                     self.state = State::Content;
                 }
                 State::Content => {
+                    // SECURITY: Content is not limited, so a part can be arbitrarily large. This is not a denial-of-service weakness: content is reported as it arrives, borrowed from the caller's input, so the parser holds none of it, and design/scope.md puts content limits with the consumer, such as `base-web-content`'s field and upload limits, which know what each part is for.
                     return match self.find(rest) {
                         Found::Delimiter(0) => {
                             *consumed += self.delimiter.len();
@@ -311,7 +312,7 @@ impl MultipartParser {
                     };
                 }
                 State::End => {
-                    // The epilogue is ignored.
+                    // SECURITY: The epilogue is ignored and not limited. This is not a denial-of-service weakness: it is consumed as it arrives without being kept or reported, so it costs no memory, and a limit on the body's total size belongs to the transport or the consumer.
                     *consumed += rest.len();
                     return Ok(MultipartEvent::End);
                 }
