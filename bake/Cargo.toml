@@ -1,0 +1,10 @@
+[package]
+name = "base-web-multipart-bake"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+bake = "0.20.1"
+# SECURITY: The open-ended requirement can select a future major version on `cargo update`, but a compromised publisher could as easily ship a compatible release; `Cargo.lock` and `--locked` CI builds mean a new version only arrives through a reviewed lockfile change. The published crate does not depend on this private task package.
+base-project = ">=0.1.7"

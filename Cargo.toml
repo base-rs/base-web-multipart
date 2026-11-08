@@ -1,0 +1,26 @@
+[package]
+name = "base-web-multipart"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+license = "MIT"
+description = "Sans-I/O parsing and writing of MIME multipart bodies, following RFC 2046 and RFC 7578"
+repository = "https://github.com/base-rs/base-web-multipart"
+readme = "readme.md"
+keywords = ["multipart", "mime", "form-data", "rfc2046", "web"]
+categories = ["web-programming", "parser-implementations", "email"]
+include = ["src/**", "context/**", "Cargo.toml", "readme.md", "license.md", "releases.md"]
+
+[workspace]
+members = ["bake"]
+resolver = "3"
+
+[workspace.metadata.bake.release]
+reviewers = ["base-rs/maintainers"]
+
+[dependencies]
+base-message = "0.1"
+base-web-media-type = "0.1"
+getrandom = "0.4.3"
+memchr = "2"
+
