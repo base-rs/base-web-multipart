@@ -65,19 +65,22 @@ A part's header section is a field section, which `base-message` interprets. `Pa
 
 ```rust
 use base_message::FieldSection;
-use base_web_multipart::{Boundary, PartHeaders, parts};
+use base_web_multipart::{Boundary, ParameterRules, PartHeaders, parts};
 
 let body = b"--XyZ\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"me.png\"\r\nContent-Type: image/png\r\n\r\n\x89PNG\r\n--XyZ--";
 let boundary = Boundary::new("XyZ")?;
 let part = parts(body, &boundary).next().expect("one part")?;
 let headers = PartHeaders::interpret(part.head())?;
 let disposition = headers.content_disposition.expect("form parts have a disposition");
-assert_eq!((disposition.name(), disposition.filename()), (Some("avatar"), Some("me.png")));
+assert_eq!(disposition.name(ParameterRules::FormData)?.as_deref(), Some("avatar"));
+assert_eq!(disposition.filename(ParameterRules::FormData)?.as_deref(), Some("me.png"));
 assert_eq!(headers.content_type.map(|content_type| content_type.media_type().essence().to_owned()).as_deref(), Some("image/png"));
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-The disposition borrows its name and filename from the body. A filename is what the sender chose, so check it before using it as a local path. To read more fields, declare a section of your own that flattens `PartHeaders`; see the `base-message` guides.
+The disposition borrows its name and filename from the body. A filename is what the sender chose, so check it before using it as a local path.
+
+Reading a name or filename takes `ParameterRules`, which say what to do with extended parameters such as `filename*`. RFC 7578 forbids them in form data, and readers disagree about whether `filename` or `filename*` applies when both are sent, so `ParameterRules::FormData` refuses any: a front end and an application can then never see different names. Browsers and common clients don't send them. `ParameterRules::Mime` follows RFC 2231 for other MIME parts, such as email attachments, decoding `filename*` and preferring it. `ParameterRules::for_media_type` chooses from the body's content type. To read more fields, declare a section of your own that flattens `PartHeaders`; see the `base-message` guides.
 
 `parts` is a convenience for a body that is already in memory: each part's content is one slice of the body. It applies the same limits as the parser.
 

@@ -3,6 +3,7 @@
 
 use base_message::{FieldErrorKind, FieldSection, FieldType, FieldValueError};
 use base_web_media_type::MediaType;
+use base_web_multipart::ParameterRules::{self, FormData, Mime};
 use base_web_multipart::{
     Boundary, ContentDisposition, ContentTransferEncoding, ContentType, PartHeaders, parts,
 };
@@ -24,11 +25,14 @@ fn parses_dispositions_and_their_parameters() {
         "the type is lowercased"
     );
     assert_eq!(
-        parsed.name(),
+        parsed.name(FormData).unwrap().as_deref(),
         Some("a \"quoted\\ name\""),
         "quoted pairs are unescaped"
     );
-    assert_eq!(parsed.filename(), Some("plain.txt"));
+    assert_eq!(
+        parsed.filename(FormData).unwrap().as_deref(),
+        Some("plain.txt")
+    );
     assert_eq!(
         parsed.parameter("SIZE"),
         Some("12"),
@@ -47,14 +51,17 @@ fn parses_dispositions_and_their_parameters() {
         (
             parsed.disposition_type(),
             parsed.parameters().len(),
-            parsed.name()
+            parsed.name(FormData).unwrap().as_deref()
         ),
         ("inline", 0, None)
     );
     // UTF-8 in a quoted filename, as browsers send it, is kept, and the parse borrows when nothing is unescaped.
     let value = "attachment; filename=\"r\u{e9}sum\u{e9}.pdf\"".as_bytes();
     let parsed = disposition(value).unwrap();
-    assert_eq!(parsed.filename(), Some("r\u{e9}sum\u{e9}.pdf"));
+    assert_eq!(
+        parsed.filename(FormData).unwrap().as_deref(),
+        Some("r\u{e9}sum\u{e9}.pdf")
+    );
     let owned: ContentDisposition<'static> = parsed.clone().into_owned();
     assert_eq!(owned, parsed);
     assert_eq!(
@@ -230,13 +237,19 @@ fn interprets_part_headers_from_a_body() {
     let headers = UploadHeaders::interpret(part.head()).unwrap();
     let disposition = headers.standard.content_disposition.as_ref().unwrap();
     assert_eq!(
-        (disposition.name(), disposition.filename()),
+        (
+            disposition.name(FormData).unwrap().as_deref(),
+            disposition.filename(FormData).unwrap().as_deref()
+        ),
         (Some("upload"), Some("a.txt"))
     );
-    assert!(matches!(
-        disposition.filename().map(Cow::Borrowed),
-        Some(Cow::Borrowed("a.txt"))
-    ));
+    assert!(
+        matches!(
+            disposition.filename(FormData).unwrap(),
+            Some(Cow::Borrowed("a.txt"))
+        ),
+        "the filename is borrowed from the body"
+    );
     assert_eq!(
         headers
             .standard
@@ -276,10 +289,13 @@ fn keeps_backslashes_that_escape_nothing() {
     // Browsers send Windows paths without escaping their backslashes.
     let parsed =
         disposition(b"form-data; name=\"upload\"; filename=\"C:\\Users\\me\\a.txt\"").unwrap();
-    assert_eq!(parsed.filename(), Some("C:\\Users\\me\\a.txt"));
+    assert_eq!(
+        parsed.filename(FormData).unwrap().as_deref(),
+        Some("C:\\Users\\me\\a.txt")
+    );
     let parsed = disposition(b"form-data; name=\"a \\\"b\\\" \\\\ \\c\"").unwrap();
     assert_eq!(
-        parsed.name(),
+        parsed.name(FormData).unwrap().as_deref(),
         Some("a \"b\" \\ \\c"),
         "only a quote or backslash is escaped"
     );
@@ -340,4 +356,133 @@ fn debug_output_of_iterators_shows_no_content() {
         "PartFields { remaining: <19 bytes> }"
     );
     assert!(!format!("{iterator:?}{:?}", part.head().fields()).contains("hunter2"));
+}
+
+#[test]
+fn form_data_refuses_extended_parameters() {
+    // Readers disagree about which of these applies: Go and Rack read `evil.php`, Python's email package `safe.txt`. RFC 7578 forbids `filename*` in form data, so neither is chosen.
+    for value in [
+        &b"form-data; name=\"upload\"; filename=\"safe.txt\"; filename*=UTF-8''evil.php"[..],
+        b"form-data; name=\"upload\"; filename*=UTF-8''evil.php",
+        b"form-data; name=\"safe\"; name*=UTF-8''admin",
+        b"form-data; name=\"upload\"; filename*0=evil; filename*1=.php",
+        b"form-data; name=\"upload\"; other*=UTF-8''x",
+    ] {
+        let parsed = disposition(value).unwrap();
+        for result in [parsed.name(FormData), parsed.filename(FormData)] {
+            assert_eq!(
+                result.unwrap_err().reason(),
+                "extended parameters are not allowed in form data"
+            );
+        }
+    }
+    let parsed = disposition(b"form-data; name=a; filename*=UTF-8''evil.php").unwrap();
+    assert_eq!(
+        parsed.parameter("filename*"),
+        Some("UTF-8''evil.php"),
+        "the raw parameters are still readable"
+    );
+}
+
+#[test]
+fn mime_decodes_and_prefers_extended_parameters() {
+    // RFC 6266 section 5's example: `filename*` takes the place of the fallback.
+    let parsed =
+        disposition(b"attachment; filename=\"EURO rates\"; filename*=utf-8''%e2%82%ac%20rates")
+            .unwrap();
+    assert_eq!(
+        parsed.filename(Mime).unwrap().as_deref(),
+        Some("\u{20ac} rates")
+    );
+    assert_eq!(parsed.name(Mime).unwrap(), None);
+    let parsed = disposition(b"attachment; name=a; filename*=US-ASCII'en'plain.txt").unwrap();
+    assert!(
+        matches!(
+            parsed.filename(Mime).unwrap(),
+            Some(Cow::Borrowed("plain.txt"))
+        ),
+        "nothing percent-encoded is borrowed"
+    );
+    assert_eq!(
+        parsed.name(Mime).unwrap().as_deref(),
+        Some("a"),
+        "a plain parameter is used without an extended one"
+    );
+    assert_eq!(
+        disposition(b"attachment; filename=a.txt")
+            .unwrap()
+            .filename(Mime)
+            .unwrap()
+            .as_deref(),
+        Some("a.txt")
+    );
+    let cases: [(&[u8], &str); 8] = [
+        (
+            b"attachment; filename*=evil.php",
+            "extended parameter value has no character set",
+        ),
+        (
+            b"attachment; filename*=utf-8'evil.php",
+            "extended parameter value has no character set",
+        ),
+        (
+            b"attachment; filename*=iso-8859-1''caf%E9",
+            "extended parameter value has an unsupported character set",
+        ),
+        (
+            b"attachment; filename*=utf-8''a%2",
+            "extended parameter value has an invalid percent-encoding",
+        ),
+        (
+            b"attachment; filename*=utf-8''a%zz",
+            "extended parameter value has an invalid percent-encoding",
+        ),
+        (
+            b"attachment; filename*=us-ascii''caf%C3%A9",
+            "extended parameter value is not US-ASCII",
+        ),
+        (
+            b"attachment; filename*=utf-8''caf%E9",
+            "extended parameter value is not UTF-8",
+        ),
+        (
+            b"attachment; filename=a; filename*0=b; filename*1=c",
+            "parameter continuations are not supported",
+        ),
+    ];
+    for (value, reason) in cases {
+        assert_eq!(
+            disposition(value)
+                .unwrap()
+                .filename(Mime)
+                .unwrap_err()
+                .reason(),
+            reason,
+            "{}",
+            String::from_utf8_lossy(value)
+        );
+    }
+    assert!(
+        disposition(b"attachment; name=a; filename*=x")
+            .unwrap()
+            .name(Mime)
+            .is_ok(),
+        "only the parameter read is decoded"
+    );
+}
+
+#[test]
+fn chooses_rules_from_the_media_type() {
+    for (media_type, rules) in [
+        ("multipart/form-data; boundary=x", FormData),
+        ("Multipart/Form-Data", FormData),
+        ("multipart/mixed; boundary=x", Mime),
+        ("multipart/related", Mime),
+    ] {
+        assert_eq!(
+            ParameterRules::for_media_type(&MediaType::parse(media_type).unwrap()),
+            rules,
+            "{media_type}"
+        );
+    }
 }

@@ -3,10 +3,10 @@
 
 //! MIME multipart bodies, as RFC 2046 defines them and RFC 7578 uses them for form data, parsed and written without I/O.
 //!
-//! [`MultipartParser`] is fed bytes as they arrive and reports each part's header section and content as borrowed slices, never copying them, with [`MultipartLimits`] on the structure a hostile body could inflate. A part's header section is interpreted with `base-message`, through [`PartHeaders`] or a section of your own, and [`ContentDisposition`] reads form field names and filenames. [`MultipartWriter`] writes a body, refusing header lines and content that would change its structure for a reader, with a [`Boundary`] generated from 192 random bits.
+//! [`MultipartParser`] is fed bytes as they arrive and reports each part's header section and content as borrowed slices, never copying them, with [`MultipartLimits`] on the structure a hostile body could inflate. A part's header section is interpreted with `base-message`, through [`PartHeaders`] or a section of your own, and [`ContentDisposition`] reads form field names and filenames, following the [`ParameterRules`] of forms or of other MIME parts. [`MultipartWriter`] writes a body, refusing header lines and content that would change its structure for a reader, with a [`Boundary`] generated from 192 random bits.
 //!
 //! ```
-//! use base_web_multipart::{Boundary, ContentDisposition, MultipartWriter, PartHeaders, parts};
+//! use base_web_multipart::{Boundary, ContentDisposition, MultipartWriter, ParameterRules, PartHeaders, parts};
 //! use base_message::FieldSection;
 //!
 //! let boundary = Boundary::generate();
@@ -21,7 +21,7 @@
 //!     let part = part?;
 //!     let headers = PartHeaders::interpret(part.head())?;
 //!     let disposition = headers.content_disposition.expect("each form part has a disposition");
-//!     assert_eq!((disposition.name(), part.content()), (Some("greeting"), &b"hello"[..]));
+//!     assert_eq!((disposition.name(ParameterRules::FormData)?.as_deref(), part.content()), (Some("greeting"), &b"hello"[..]));
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
@@ -37,6 +37,7 @@ mod multipart_event;
 mod multipart_limits;
 mod multipart_parser;
 mod multipart_writer;
+mod parameter_rules;
 mod part_head;
 mod part_headers;
 mod parts;
@@ -51,6 +52,7 @@ pub use multipart_event::{MultipartEvent, Parsed};
 pub use multipart_limits::MultipartLimits;
 pub use multipart_parser::MultipartParser;
 pub use multipart_writer::{MultipartWriteError, MultipartWriter};
+pub use parameter_rules::ParameterRules;
 pub use part_head::{PartFields, PartHead};
 pub use part_headers::PartHeaders;
 pub use parts::{Part, Parts, parts};
